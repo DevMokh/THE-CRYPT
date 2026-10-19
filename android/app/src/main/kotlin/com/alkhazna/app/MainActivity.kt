@@ -1,4 +1,4 @@
-package com.thecrypt.app
+package com.alkhazna.app
 
 import android.os.Bundle
 import android.view.WindowManager
