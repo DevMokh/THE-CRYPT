@@ -5,6 +5,8 @@ import android.content.ClipboardManager
 import android.content.Context
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.os.PersistableBundle
 import android.view.WindowManager
 import io.flutter.embedding.android.FlutterActivity
@@ -12,9 +14,33 @@ import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
 
 class MainActivity : FlutterActivity() {
+    private val handler = Handler(Looper.getMainLooper())
+    private var clearTask: Runnable? = null
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         window.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
+    }
+
+    // مسح الحافظة لو لسه فيها نفس النص (أو لو أندرويد منع القراءة وأنت في الخلفية)
+    private fun clearClipIf(expected: String) {
+        try {
+            val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+            val current: String? = try {
+                cm.primaryClip?.getItemAt(0)?.text?.toString()
+            } catch (e: Exception) {
+                null
+            }
+            if (current == null || current == expected) {
+                if (Build.VERSION.SDK_INT >= 28) {
+                    cm.clearPrimaryClip()
+                } else {
+                    cm.setPrimaryClip(ClipData.newPlainText("", ""))
+                }
+            }
+        } catch (e: Exception) {
+            // تجاهل
+        }
     }
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
@@ -34,9 +60,11 @@ class MainActivity : FlutterActivity() {
                         result.success(null)
                     }
 
-                    // نسخ مع وضع علامة "حساس" عشان الكيبورد وأندرويد 13+ ما يعرضوش المحتوى
+                    // نسخ مع علامة "حساس"، ومؤقّت مسح من الجانب الأصلي
+                    // عشان يشتغل حتى لو التطبيق في الخلفية
                     "copy" -> {
                         val text = call.argument<String>("text") ?: ""
+                        val secs = (call.argument<Int>("secs") ?: 30).coerceIn(5, 300)
                         val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
                         val clip = ClipData.newPlainText("", text)
                         if (Build.VERSION.SDK_INT >= 23) {
@@ -45,25 +73,16 @@ class MainActivity : FlutterActivity() {
                             clip.description.extras = extras
                         }
                         cm.setPrimaryClip(clip)
+                        clearTask?.let { handler.removeCallbacks(it) }
+                        val task = Runnable { clearClipIf(text) }
+                        clearTask = task
+                        handler.postDelayed(task, secs * 1000L)
                         result.success(null)
                     }
 
-                    // مسح الحافظة لو لسه فيها نفس النص (أو لو أندرويد منع القراءة في الخلفية)
                     "clearIf" -> {
                         val expected = call.argument<String>("text") ?: ""
-                        val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                        val current: String? = try {
-                            cm.primaryClip?.getItemAt(0)?.text?.toString()
-                        } catch (e: Exception) {
-                            null
-                        }
-                        if (current == null || current == expected) {
-                            if (Build.VERSION.SDK_INT >= 28) {
-                                cm.clearPrimaryClip()
-                            } else {
-                                cm.setPrimaryClip(ClipData.newPlainText("", ""))
-                            }
-                        }
+                        clearClipIf(expected)
                         result.success(null)
                     }
 
