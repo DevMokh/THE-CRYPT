@@ -47,7 +47,10 @@ void main() {
           child: SafeArea(
             child: SingleChildScrollView(
               padding: const EdgeInsets.all(16),
-              child: Text('Error:\n${_short(details.exceptionAsString())}',
+              child: Text(
+                  kReleaseMode
+                      ? 'حصل خطأ غير متوقع. اقفل التطبيق وافتحه تاني.'
+                      : 'Error:\n${_short(details.exceptionAsString())}',
                   style: const TextStyle(color: Colors.redAccent)),
             ),
           ),
@@ -85,10 +88,21 @@ const int kMaxIter = 8;
 
 final ValueNotifier<int> wipe = ValueNotifier<int>(0);
 final ValueNotifier<int> idleLock = ValueNotifier<int>(0);
+final ValueNotifier<int> vaultsChanged = ValueNotifier<int>(0);
+final ValueNotifier<int> autoLockMin = ValueNotifier<int>(2);
+final ValueNotifier<int> clipSecs = ValueNotifier<int>(30);
+final ValueNotifier<bool> appLockOn = ValueNotifier<bool>(false);
+final ValueNotifier<bool> appUnlocked = ValueNotifier<bool>(true);
+final ValueNotifier<int> graceSecs = ValueNotifier<int>(0);
+final ValueNotifier<int> appIdle = ValueNotifier<int>(0);
+
+// بيمنع قايمة النسخ العادية على النصوص الحساسة (النسخ يتم من أزرار التطبيق بس)
+Widget noMenu(BuildContext context, EditableTextState state) =>
+    const SizedBox.shrink();
 bool pickerOpen = false;
 
 const weakMsg =
-    'كلمة السر ضعيفة: لازم 12 حرف على الأقل ومتنوعة ومن غير كلمات شائعة. استخدم زر 🎲';
+    'كلمة السر ضعيفة: لازم 14 حرف على الأقل ومتنوعة ومن غير كلمات شائعة. استخدم زر 🎲';
 const _commonWords = [
   'password',
   'qwerty',
@@ -102,12 +116,52 @@ const _commonWords = [
   'iloveyou',
 ];
 
+const _walks = [
+  'qwert',
+  'asdfg',
+  'zxcvb',
+  'poiuy',
+  'lkjhg',
+  'qazwsx',
+  '1qaz2wsx',
+];
+final RegExp _sameRun = RegExp(r'(.)\1{3,}');
+final RegExp _blockRepeat = RegExp(r'(.{3,6})\1');
+
+// تسلسل زي abcd أو 4321 (4 حروف متتالية أو أكتر)
+bool _hasRun(String s) {
+  var up = 1, down = 1;
+  for (var i = 1; i < s.length; i++) {
+    final d = s.codeUnitAt(i) - s.codeUnitAt(i - 1);
+    up = d == 1 ? up + 1 : 1;
+    down = d == -1 ? down + 1 : 1;
+    if (up >= 4 || down >= 4) return true;
+  }
+  return false;
+}
+
 bool isWeak(String p) {
-  if (p.length < 12) return true;
+  if (p.length < 14) return true;
   final l = p.toLowerCase();
   if (_commonWords.any((w) => l.contains(w))) return true;
+  if (_walks.any((w) => l.contains(w))) return true;
   if (p.split('').toSet().length < 6) return true;
-  return entropyBits(p) < 55;
+  if (_hasRun(l)) return true;
+  if (_sameRun.hasMatch(l) || _blockRepeat.hasMatch(l)) return true;
+  return entropyBits(p) < 60;
+}
+
+const lockWeakMsg =
+    'كلمة القفل ضعيفة: لازم 6 حروف أو أرقام على الأقل، من غير تكرار أو تسلسل (زي 123456).';
+
+// قواعد أخف من كلمات سر التشفير، لأن القفل بيتحمي بتأخير المحاولات الغلط
+bool isWeakLock(String p) {
+  if (p.length < 6) return true;
+  final l = p.toLowerCase();
+  if (_commonWords.any((w) => l.contains(w))) return true;
+  if (p.split('').toSet().length < 3) return true;
+  if (_hasRun(l) || _sameRun.hasMatch(l)) return true;
+  return false;
 }
 
 String _short(String s) => s.length > 300 ? s.substring(0, 300) : s;
@@ -400,6 +454,41 @@ String genPassword([int n = 24]) {
   return List<String>.generate(n, (_) => a[r.nextInt(a.length)]).join();
 }
 
+// مولّد متقدم: بيضمن وجود حرف واحد على الأقل من كل نوع مختار
+String genPasswordWith(int n,
+    {bool lower = true,
+    bool upper = true,
+    bool digits = true,
+    bool symbols = true,
+    bool noAmbiguous = true}) {
+  var lo = 'abcdefghijklmnopqrstuvwxyz';
+  var up = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
+  var di = '0123456789';
+  const sy = '!@#\$%^&*-_=+?';
+  if (noAmbiguous) {
+    lo = lo.replaceAll('l', '');
+    up = up.replaceAll('I', '').replaceAll('O', '');
+    di = di.replaceAll('0', '').replaceAll('1', '');
+  }
+  final sets = <String>[
+    if (lower) lo,
+    if (upper) up,
+    if (digits) di,
+    if (symbols) sy,
+  ];
+  if (sets.isEmpty) return '';
+  final all = sets.join();
+  final r = Random.secure();
+  String one() =>
+      List<String>.generate(n, (_) => all[r.nextInt(all.length)]).join();
+  for (var t = 0; t < 50; t++) {
+    final s = one();
+    final ok = sets.every((cs) => s.split('').any((ch) => cs.contains(ch)));
+    if (ok) return s;
+  }
+  return one();
+}
+
 class SecureWindow {
   static const _ch = MethodChannel('vault/secure');
 
@@ -409,9 +498,9 @@ class SecureWindow {
     } catch (_) {}
   }
 
-  static Future<bool> copy(String text) async {
+  static Future<bool> copy(String text, int secs) async {
     try {
-      await _ch.invokeMethod('copy', {'text': text});
+      await _ch.invokeMethod('copy', {'text': text, 'secs': secs});
       return true;
     } catch (_) {
       return false;
@@ -428,15 +517,16 @@ class SecureWindow {
 Timer? _clipTimer;
 
 Future<void> copySecure(BuildContext c, String text) async {
-  final ok = await SecureWindow.copy(text);
+  final secs = clipSecs.value;
+  final ok = await SecureWindow.copy(text, secs);
   if (!ok) await Clipboard.setData(ClipboardData(text: text));
   HapticFeedback.lightImpact();
   if (c.mounted) {
-    ScaffoldMessenger.of(c).showSnackBar(const SnackBar(
-        content: Text('اتنسخ، وهيتمسح من الحافظة بعد 30 ثانية')));
+    ScaffoldMessenger.of(c).showSnackBar(SnackBar(
+        content: Text('اتنسخ، وهيتمسح من الحافظة بعد $secs ثانية')));
   }
   _clipTimer?.cancel();
-  _clipTimer = Timer(const Duration(seconds: 30), () async {
+  _clipTimer = Timer(Duration(seconds: secs), () async {
     if (ok) {
       await SecureWindow.clearIf(text);
     } else {
@@ -723,6 +813,7 @@ class OutBox extends StatelessWidget {
           const SizedBox(height: 10),
           SelectableText(
             text,
+            contextMenuBuilder: noMenu,
             textDirection: mono ? TextDirection.ltr : null,
             style: TextStyle(
               fontSize: mono ? 13.5 : 15,
@@ -766,7 +857,7 @@ class VaultApp extends StatelessWidget {
       builder: (c, child) => Directionality(
           textDirection: TextDirection.rtl,
           child: child ?? const SizedBox.shrink()),
-      home: const VaultHome(),
+      home: const AppLockGate(child: VaultHome()),
     );
   }
 }
@@ -786,21 +877,27 @@ class _VaultHomeState extends State<VaultHome> with WidgetsBindingObserver {
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
+    autoLockMin.addListener(_touch);
     _loadSecure();
     _touch();
   }
 
-  // قفل الخزنة تلقائيًا بعد دقيقتين من غير أي لمس
+  // قفل الخزنة تلقائيًا بعد المدة المحددة من غير أي لمس
   void _touch() {
     _idle?.cancel();
-    _idle = Timer(const Duration(minutes: 2), () {
+    _idle = Timer(Duration(minutes: autoLockMin.value), () {
       idleLock.value++;
+      appIdle.value++;
     });
   }
 
   Future<void> _loadSecure() async {
     try {
       final p = await SharedPreferences.getInstance();
+      final al = p.getInt('autolock') ?? 2;
+      final cs = p.getInt('clip') ?? 30;
+      autoLockMin.value = const [1, 2, 5, 10].contains(al) ? al : 2;
+      clipSecs.value = const [15, 30, 60].contains(cs) ? cs : 30;
       final v = p.getBool('secure') ?? true;
       if (mounted) setState(() => secure = v);
       SecureWindow.set(v);
@@ -820,6 +917,7 @@ class _VaultHomeState extends State<VaultHome> with WidgetsBindingObserver {
   @override
   void dispose() {
     _idle?.cancel();
+    autoLockMin.removeListener(_touch);
     WidgetsBinding.instance.removeObserver(this);
     super.dispose();
   }
@@ -869,7 +967,7 @@ class _VaultHomeState extends State<VaultHome> with WidgetsBindingObserver {
               _tip(Icons.wifi_off,
                   'كود التطبيق مفيهوش أي اتصال بالإنترنت، ومفيش حاجة بتتبعت لأي مكان.'),
               _tip(Icons.timer,
-                  'الخزنة بتتقفل لوحدها بعد دقيقتين من غير لمس، أو لما تخرج من التطبيق.'),
+                  'الخزنة بتتقفل لوحدها بعد المدة اللي تحددها في تاب «أدوات» (الافتراضي دقيقتين)، أو لما تخرج من التطبيق.'),
             ],
           ),
         ),
@@ -906,13 +1004,20 @@ class _VaultHomeState extends State<VaultHome> with WidgetsBindingObserver {
         ),
         body: IndexedStack(
           index: tab,
-          children: const [EncryptTab(), DecryptTab(), FilesTab(), VaultTab()],
+          children: const [
+            EncryptTab(),
+            DecryptTab(),
+            FilesTab(),
+            VaultTab(),
+            ToolsTab(),
+          ],
         ),
         bottomNavigationBar: NavigationBar(
           selectedIndex: tab,
           backgroundColor: kCard,
           indicatorColor: kAccentDim,
           onDestinationSelected: (i) {
+            HapticFeedback.selectionClick();
             if (tab == 3 && i != 3) idleLock.value++;
             setState(() => tab = i);
           },
@@ -933,6 +1038,10 @@ class _VaultHomeState extends State<VaultHome> with WidgetsBindingObserver {
                 icon: Icon(Icons.inventory_2_outlined),
                 selectedIcon: Icon(Icons.inventory_2),
                 label: 'خزنتي'),
+            NavigationDestination(
+                icon: Icon(Icons.tune_outlined),
+                selectedIcon: Icon(Icons.tune),
+                label: 'أدوات'),
           ],
         ),
       ),
@@ -1014,6 +1123,9 @@ class _EncryptTabState extends State<EncryptTab> {
       TextField(
         controller: text,
         maxLines: 6,
+        autocorrect: false,
+        enableSuggestions: false,
+        enableIMEPersonalizedLearning: false,
         decoration: inputDeco('النص المراد تشفيره'),
       ),
       const SizedBox(height: 12),
@@ -1120,6 +1232,9 @@ class _DecryptTabState extends State<DecryptTab> {
       TextField(
         controller: input,
         maxLines: 6,
+        autocorrect: false,
+        enableSuggestions: false,
+        enableIMEPersonalizedLearning: false,
         textDirection: TextDirection.ltr,
         decoration: inputDeco(
           'النص المشفّر (يبدأ بـ KC1.)',
@@ -1621,6 +1736,67 @@ class VaultStore {
     await p.remove('vault_fails');
     await p.remove('vault_until');
   }
+
+  // مسح كل الخزن (بعد ما أي حفظ معلّق يخلص)
+  static Future<void> deleteAll() {
+    final f = _q.then((_) async {
+      final p = await SharedPreferences.getInstance();
+      final keys =
+          p.getKeys().where((k) => k.startsWith('vault.')).toList();
+      for (final k in keys) {
+        await p.remove(k);
+      }
+      await p.remove('vault_fails');
+      await p.remove('vault_until');
+    });
+    _q = f.catchError((_) {});
+    return f;
+  }
+
+  // النص المشفّر المخزّن للخزنة (هو نفسه محتوى النسخة الاحتياطية)
+  static Future<String?> exportRaw(String slot) async {
+    await _q;
+    final p = await SharedPreferences.getInstance();
+    return p.getString(slot);
+  }
+
+  // بيتأكد إن الملف شكله خزنة سليمة (من غير كلمة السر) ويخزنها في خانة فاضية
+  // النتيجة: ok / bad / dup / full
+  static Future<String> importRaw(String raw) async {
+    final s = raw.trim();
+    try {
+      final b = base64Url.decode(base64Url.normalize(s));
+      if (b.length < 26 + 12 + 16 ||
+          b[0] != 0x4B ||
+          b[1] != 0x56 ||
+          (b[2] != 1 && b[2] != 2)) {
+        return 'bad';
+      }
+      final algo = b[3];
+      if (!_validAlgo(algo) || (b[2] == 1 && algo != 1)) return 'bad';
+      final mem = ByteData.sublistView(b, 4, 8).getUint32(0);
+      final iter = b[8];
+      if (mem < 8192 ||
+          mem > kMaxMem ||
+          iter < 1 ||
+          iter > kMaxIter ||
+          b[9] != 1) {
+        return 'bad';
+      }
+    } catch (_) {
+      return 'bad';
+    }
+    await _q;
+    final used = await slots();
+    final p = await SharedPreferences.getInstance();
+    for (final k in used) {
+      if (p.getString(k) == s) return 'dup';
+    }
+    final slot = await freeSlot();
+    if (slot == null) return 'full';
+    await p.setString(slot, s);
+    return 'ok';
+  }
 }
 
 class ItemDialog extends StatefulWidget {
@@ -1668,6 +1844,9 @@ class _ItemDialogState extends State<ItemDialog> {
             const SizedBox(height: 6),
             TextField(
               controller: t,
+              autocorrect: false,
+              enableSuggestions: false,
+              enableIMEPersonalizedLearning: false,
               decoration: inputDeco('العنوان', icon: Icons.title),
             ),
             const SizedBox(height: 10),
@@ -1675,6 +1854,7 @@ class _ItemDialogState extends State<ItemDialog> {
               controller: u,
               autocorrect: false,
               enableSuggestions: false,
+              enableIMEPersonalizedLearning: false,
               textDirection: TextDirection.ltr,
               decoration:
                   inputDeco('اسم المستخدم / الإيميل', icon: Icons.person),
@@ -1685,6 +1865,9 @@ class _ItemDialogState extends State<ItemDialog> {
             TextField(
               controller: n,
               maxLines: 4,
+              autocorrect: false,
+              enableSuggestions: false,
+              enableIMEPersonalizedLearning: false,
               decoration: inputDeco('ملاحظات', icon: Icons.notes),
             ),
           ]),
@@ -1713,10 +1896,13 @@ class ItemTile extends StatefulWidget {
   const ItemTile(
       {super.key,
       required this.item,
+      required this.fav,
+      required this.onFav,
       required this.onEdit,
       required this.onDelete});
   final Map<String, dynamic> item;
-  final VoidCallback onEdit, onDelete;
+  final bool fav;
+  final VoidCallback onFav, onEdit, onDelete;
   @override
   State<ItemTile> createState() => _ItemTileState();
 }
@@ -1752,8 +1938,13 @@ class _ItemTileState extends State<ItemTile> {
                 style: const TextStyle(
                     color: kAccent, fontWeight: FontWeight.w800)),
           ),
-          title: Text(title.isEmpty ? '(بدون عنوان)' : title,
-              style: const TextStyle(fontWeight: FontWeight.w700)),
+          title: Row(children: [
+            Expanded(
+              child: Text(title.isEmpty ? '(بدون عنوان)' : title,
+                  style: const TextStyle(fontWeight: FontWeight.w700)),
+            ),
+            if (widget.fav) const Icon(Icons.star, size: 18, color: kWarn),
+          ]),
           subtitle: user.isEmpty
               ? null
               : Text(user, style: const TextStyle(color: kMuted, fontSize: 12.5)),
@@ -1764,7 +1955,8 @@ class _ItemTileState extends State<ItemTile> {
               Row(children: [
                 const Icon(Icons.person, size: 18, color: kMuted),
                 const SizedBox(width: 8),
-                Expanded(child: SelectableText(user)),
+                Expanded(
+                    child: SelectableText(user, contextMenuBuilder: noMenu)),
                 IconButton(
                   icon: const Icon(Icons.copy, size: 20),
                   tooltip: 'نسخ اسم المستخدم',
@@ -1778,6 +1970,7 @@ class _ItemTileState extends State<ItemTile> {
                 Expanded(
                   child: show
                       ? SelectableText(secret,
+                          contextMenuBuilder: noMenu,
                           textDirection: TextDirection.ltr,
                           style: const TextStyle(fontFamily: 'monospace'))
                       : const Text('••••••••••••'),
@@ -1797,9 +1990,16 @@ class _ItemTileState extends State<ItemTile> {
               Padding(
                 padding: const EdgeInsets.symmetric(vertical: 6),
                 child: SelectableText(note,
+                    contextMenuBuilder: noMenu,
                     style: const TextStyle(color: kMuted, height: 1.4)),
               ),
             Row(mainAxisAlignment: MainAxisAlignment.end, children: [
+              TextButton.icon(
+                onPressed: widget.onFav,
+                icon: Icon(widget.fav ? Icons.star : Icons.star_border,
+                    size: 18),
+                label: Text(widget.fav ? 'إلغاء التثبيت' : 'تثبيت'),
+              ),
               TextButton.icon(
                 onPressed: widget.onEdit,
                 icon: const Icon(Icons.edit, size: 18),
@@ -1835,12 +2035,15 @@ class _VaultTabState extends State<VaultTab> {
   int cl = 1;
   String? err;
   int _epoch = 0;
+  final search = TextEditingController();
+  String q = '';
 
   @override
   void initState() {
     super.initState();
     wipe.addListener(_lock);
     idleLock.addListener(_lock);
+    vaultsChanged.addListener(_refreshSlots);
     _refreshSlots();
   }
 
@@ -1848,10 +2051,12 @@ class _VaultTabState extends State<VaultTab> {
   void dispose() {
     wipe.removeListener(_lock);
     idleLock.removeListener(_lock);
+    vaultsChanged.removeListener(_refreshSlots);
     final s = session;
     if (s != null) VaultStore.close(s);
     pw.dispose();
     pw2.dispose();
+    search.dispose();
     super.dispose();
   }
 
@@ -1880,11 +2085,13 @@ class _VaultTabState extends State<VaultTab> {
     if (s != null) VaultStore.close(s);
     pw.clear();
     pw2.clear();
+    search.clear();
     if (!mounted) return;
     if (s != null) Navigator.of(context).popUntil((r) => r.isFirst);
     setState(() {
       err = null;
       creating = false;
+      q = '';
     });
   }
 
@@ -2046,7 +2253,15 @@ class _VaultTabState extends State<VaultTab> {
         i >= cur.items.length) {
       return;
     }
+    if (cur.items[i]['f'] == true) r['f'] = true;
     setState(() => cur.items[i] = r);
+    await _persist();
+  }
+
+  Future<void> _fav(int i) async {
+    final s = session;
+    if (s == null || i >= s.items.length) return;
+    setState(() => s.items[i]['f'] = s.items[i]['f'] != true);
     await _persist();
   }
 
@@ -2079,7 +2294,84 @@ class _VaultTabState extends State<VaultTab> {
     await _refreshSlots();
   }
 
+  Future<void> _export() async {
+    final s = session;
+    if (s == null) return;
+    pickerOpen = true;
+    try {
+      final raw = await VaultStore.exportRaw(s.slot);
+      if (raw == null) {
+        _snack('مفيش بيانات للتصدير');
+        return;
+      }
+      final dest = await FilePicker.platform.saveFile(
+        dialogTitle: 'احفظ النسخة الاحتياطية',
+        fileName: 'vault_backup.kcv',
+        bytes: Uint8List.fromList(utf8.encode(raw)),
+      );
+      _snack(dest == null
+          ? 'اتلغى الحفظ'
+          : 'تم حفظ النسخة الاحتياطية (مشفّرة بنفس كلمة سر الخزنة)');
+    } catch (_) {
+      _snack('حصل خطأ أثناء التصدير');
+    } finally {
+      pickerOpen = false;
+    }
+  }
+
+  Future<void> _import() async {
+    if (busy) return;
+    pickerOpen = true;
+    try {
+      final r = await FilePicker.platform.pickFiles(withData: false);
+      if (r == null || r.files.isEmpty) return;
+      final path = r.files.single.path;
+      if (path == null) {
+        _snack('معرفتش أقرأ الملف ده');
+        return;
+      }
+      final f = File(path);
+      if (await f.length() > 5 * 1024 * 1024) {
+        _snack('الملف ده مش نسخة خزنة (حجمه كبير)');
+        return;
+      }
+      final raw = utf8.decode(await f.readAsBytes(), allowMalformed: true);
+      final res = await VaultStore.importRaw(raw);
+      if (res == 'ok') {
+        _snack('تم الاستيراد. افتح الخزنة بكلمة السر بتاعتها');
+        await _refreshSlots();
+      } else if (res == 'dup') {
+        _snack('الخزنة دي موجودة عندك بالفعل');
+      } else if (res == 'full') {
+        _snack('وصلت للحد الأقصى من الخزن. احذف واحدة الأول');
+      } else {
+        _snack('الملف ده مش نسخة احتياطية سليمة');
+      }
+    } catch (_) {
+      _snack('حصل خطأ أثناء الاستيراد');
+    } finally {
+      pickerOpen = false;
+    }
+  }
+
+  bool _match(Map<String, dynamic> m, String ql) {
+    for (final k in const ['t', 'u', 'n']) {
+      if ((m[k] ?? '').toString().toLowerCase().contains(ql)) return true;
+    }
+    return false;
+  }
+
   Widget _open(Session s) {
+    final ql = q.trim().toLowerCase();
+    final idx = <int>[
+      for (var i = 0; i < s.items.length; i++)
+        if (ql.isEmpty || _match(s.items[i], ql)) i,
+    ];
+    idx.sort((a, b) {
+      final fa = s.items[a]['f'] == true ? 0 : 1;
+      final fb = s.items[b]['f'] == true ? 0 : 1;
+      return fa != fb ? fa - fb : a - b;
+    });
     return Column(children: [
       Padding(
         padding: const EdgeInsets.fromLTRB(16, 4, 8, 4),
@@ -2104,13 +2396,28 @@ class _VaultTabState extends State<VaultTab> {
           PopupMenuButton<String>(
             onSelected: (v) {
               if (v == 'del') _deleteVault();
+              if (v == 'export') _export();
             },
             itemBuilder: (_) => const [
+              PopupMenuItem<String>(
+                  value: 'export', child: Text('تصدير نسخة احتياطية')),
               PopupMenuItem<String>(value: 'del', child: Text('حذف الخزنة')),
             ],
           ),
         ]),
       ),
+      if (s.items.length > 4 || q.isNotEmpty)
+        Padding(
+          padding: const EdgeInsets.fromLTRB(16, 4, 16, 4),
+          child: TextField(
+            controller: search,
+            autocorrect: false,
+            enableSuggestions: false,
+            enableIMEPersonalizedLearning: false,
+            onChanged: (v) => setState(() => q = v),
+            decoration: inputDeco('بحث في الخزنة', icon: Icons.search),
+          ),
+        ),
       Expanded(
         child: s.items.isEmpty
             ? Center(
@@ -2127,16 +2434,25 @@ class _VaultTabState extends State<VaultTab> {
                           style: TextStyle(color: kMuted)),
                     ]),
               )
-            : ListView.builder(
-                padding: const EdgeInsets.fromLTRB(16, 8, 16, 24),
-                itemCount: s.items.length,
-                itemBuilder: (c, i) => ItemTile(
-                  key: ObjectKey(s.items[i]),
-                  item: s.items[i],
-                  onEdit: () => _edit(i),
-                  onDelete: () => _delete(i),
-                ),
-              ),
+            : (idx.isEmpty
+                ? const Center(
+                    child: Text('مفيش نتايج للبحث',
+                        style: TextStyle(color: kMuted)))
+                : ListView.builder(
+                    padding: const EdgeInsets.fromLTRB(16, 8, 16, 24),
+                    itemCount: idx.length,
+                    itemBuilder: (c, n) {
+                      final i = idx[n];
+                      return ItemTile(
+                        key: ObjectKey(s.items[i]),
+                        item: s.items[i],
+                        fav: s.items[i]['f'] == true,
+                        onFav: () => _fav(i),
+                        onEdit: () => _edit(i),
+                        onDelete: () => _delete(i),
+                      );
+                    },
+                  )),
       ),
     ]);
   }
@@ -2215,10 +2531,16 @@ class _VaultTabState extends State<VaultTab> {
                   }),
           child: const Text('رجوع'),
         ),
-      const SizedBox(height: 16),
+      const SizedBox(height: 8),
+      TextButton.icon(
+        onPressed: busy ? null : _import,
+        icon: const Icon(Icons.download),
+        label: const Text('استيراد نسخة احتياطية'),
+      ),
+      const SizedBox(height: 8),
       const Text(
         'الخزنة بتستخدم تشفير مزدوج (XChaCha20 + AES-256-GCM). كل خزنة ليها كلمة سر مستقلة. '
-        'بتتقفل لوحدها لما تخرج من التطبيق أو بعد دقيقتين من غير لمس. '
+        'بتتقفل لوحدها لما تخرج من التطبيق أو بعد المدة المحددة في تاب «أدوات» من غير لمس. '
         'بعد 3 محاولات غلط بيتفعّل انتظار بيزيد مع كل محاولة.',
         style: TextStyle(fontSize: 12, color: kMuted, height: 1.5),
       ),
@@ -2230,5 +2552,938 @@ class _VaultTabState extends State<VaultTab> {
     if (!loaded) return const Center(child: CircularProgressIndicator());
     final s = session;
     return s != null ? _open(s) : _locked();
+  }
+}
+
+// ============================================================
+//  تاب الأدوات والإعدادات
+// ============================================================
+class ToolsTab extends StatefulWidget {
+  const ToolsTab({super.key});
+  @override
+  State<ToolsTab> createState() => _ToolsTabState();
+}
+
+class _ToolsTabState extends State<ToolsTab> {
+  int len = 24;
+  bool lower = true, upper = true, digits = true, symbols = true, noAmb = true;
+  String gen = '';
+  bool wiping = false;
+  bool lockBusy = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _gen();
+    wipe.addListener(_clearGen);
+  }
+
+  @override
+  void dispose() {
+    wipe.removeListener(_clearGen);
+    super.dispose();
+  }
+
+  void _clearGen() {
+    if (!mounted) return;
+    setState(() => gen = '');
+  }
+
+  void _gen() {
+    gen = genPasswordWith(len,
+        lower: lower,
+        upper: upper,
+        digits: digits,
+        symbols: symbols,
+        noAmbiguous: noAmb);
+  }
+
+  Future<void> _saveInt(String k, int v) async {
+    try {
+      final p = await SharedPreferences.getInstance();
+      await p.setInt(k, v);
+    } catch (_) {}
+  }
+
+  void _snack(String m) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(m)));
+  }
+
+  Future<void> _wipeAll() async {
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: kCard,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(22)),
+        title: const Text('مسح كل الخزن؟'),
+        content: const Text(
+            'هيتحذف كل اللي في الخزن نهائيًا من الموبايل ده. مفيش أي طريقة للرجوع فيه إلا لو معاك نسخة احتياطية.'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(false),
+            child: const Text('إلغاء'),
+          ),
+          FilledButton(
+            style: FilledButton.styleFrom(backgroundColor: kBad),
+            onPressed: () => Navigator.of(ctx).pop(true),
+            child: const Text('امسح كل حاجة'),
+          ),
+        ],
+      ),
+    );
+    if (ok != true || !mounted) return;
+    setState(() => wiping = true);
+    try {
+      idleLock.value++;
+      await VaultStore.deleteAll();
+      await Clipboard.setData(const ClipboardData(text: ''));
+      vaultsChanged.value++;
+      _snack('اتمسحت كل الخزن');
+    } catch (_) {
+      _snack('حصل خطأ أثناء المسح');
+    } finally {
+      if (mounted) setState(() => wiping = false);
+    }
+  }
+
+  // بيتأكد من كلمة قفل التطبيق الحالية (مع تأخير المحاولات الغلط)
+  Future<bool> _askCurrent() async {
+    final cur = await showDialog<String>(
+      context: context,
+      builder: (_) =>
+          const PwPromptDialog(title: 'اكتب كلمة قفل التطبيق الحالية'),
+    );
+    if (cur == null || !mounted) return false;
+    final wait = await AppLockStore.lockedForMs();
+    if (wait > 0) {
+      _snack('محاولات غلط كتير. استنى ${(wait / 1000).ceil()} ثانية');
+      return false;
+    }
+    final ok = await AppLockStore.verify(cur);
+    if (ok) {
+      await AppLockStore.noteOk();
+    } else {
+      await AppLockStore.noteFail();
+      _snack('كلمة السر غلط');
+    }
+    return ok;
+  }
+
+  Future<void> _enableLock() async {
+    if (lockBusy) return;
+    setState(() => lockBusy = true);
+    try {
+      final np = await showDialog<String>(
+        context: context,
+        builder: (_) => const PwPromptDialog(
+            title: 'كلمة قفل التطبيق الجديدة', confirm: true),
+      );
+      if (np == null || !mounted) return;
+      await AppLockStore.setPassword(np);
+      final p = await SharedPreferences.getInstance();
+      await p.remove('lock_skip');
+      appLockOn.value = true;
+      appUnlocked.value = true;
+      _snack('قفل التطبيق اتفعّل');
+    } catch (_) {
+      _snack('حصل خطأ أثناء التفعيل');
+    } finally {
+      if (mounted) setState(() => lockBusy = false);
+    }
+  }
+
+  Future<void> _changeLock() async {
+    if (lockBusy) return;
+    setState(() => lockBusy = true);
+    try {
+      if (!await _askCurrent() || !mounted) return;
+      final np = await showDialog<String>(
+        context: context,
+        builder: (_) => const PwPromptDialog(
+            title: 'كلمة قفل التطبيق الجديدة', confirm: true),
+      );
+      if (np == null || !mounted) return;
+      await AppLockStore.setPassword(np);
+      _snack('اتغيّرت كلمة القفل');
+    } catch (_) {
+      _snack('حصل خطأ أثناء التغيير');
+    } finally {
+      if (mounted) setState(() => lockBusy = false);
+    }
+  }
+
+  Future<void> _disableLock() async {
+    if (lockBusy) return;
+    setState(() => lockBusy = true);
+    try {
+      if (!await _askCurrent() || !mounted) return;
+      await AppLockStore.remove();
+      final p = await SharedPreferences.getInstance();
+      await p.setBool('lock_skip', true);
+      appLockOn.value = false;
+      appUnlocked.value = true;
+      _snack('قفل التطبيق اتوقّف');
+    } catch (_) {
+      _snack('حصل خطأ أثناء الإيقاف');
+    } finally {
+      if (mounted) setState(() => lockBusy = false);
+    }
+  }
+
+  Widget _lockPanel() {
+    return Panel(
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        const SectionLabel('قفل التطبيق'),
+        ValueListenableBuilder<bool>(
+          valueListenable: appLockOn,
+          builder: (c, on, _) {
+            if (!on) {
+              return Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Text(
+                      'القفل مش شغّال: أي حد يفتح موبايلك يقدر يفتح التطبيق.',
+                      style:
+                          TextStyle(fontSize: 12.5, color: kMuted, height: 1.5),
+                    ),
+                    const SizedBox(height: 10),
+                    FilledButton.icon(
+                      style: kBtn,
+                      onPressed: lockBusy ? null : _enableLock,
+                      icon: const Icon(Icons.lock),
+                      label: Text(
+                          lockBusy ? 'جارٍ التنفيذ...' : 'تفعيل قفل التطبيق'),
+                    ),
+                  ]);
+            }
+            return Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Row(children: [
+                    Icon(Icons.verified_user, color: kAccent, size: 20),
+                    SizedBox(width: 8),
+                    Text('القفل شغّال',
+                        style: TextStyle(
+                            color: kAccent, fontWeight: FontWeight.w700)),
+                  ]),
+                  const SizedBox(height: 12),
+                  const SectionLabel('يتقفل بعد الخروج من التطبيق'),
+                  ValueListenableBuilder<int>(
+                    valueListenable: graceSecs,
+                    builder: (c2, g, _) => SizedBox(
+                      width: double.infinity,
+                      child: SegmentedButton<int>(
+                        showSelectedIcon: false,
+                        segments: const [
+                          ButtonSegment(value: 0, label: Text('فورًا')),
+                          ButtonSegment(value: 30, label: Text('30 ث')),
+                          ButtonSegment(value: 120, label: Text('2 د')),
+                        ],
+                        selected: {g},
+                        onSelectionChanged: (s) {
+                          graceSecs.value = s.first;
+                          _saveInt('lockgrace', s.first);
+                        },
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+                  OutlinedButton.icon(
+                    onPressed: lockBusy ? null : _changeLock,
+                    icon: const Icon(Icons.password),
+                    label: const Text('تغيير كلمة القفل'),
+                  ),
+                  const SizedBox(height: 8),
+                  OutlinedButton.icon(
+                    onPressed: lockBusy ? null : _disableLock,
+                    icon: const Icon(Icons.lock_open),
+                    label: const Text('إيقاف القفل'),
+                  ),
+                ]);
+          },
+        ),
+      ]),
+    );
+  }
+
+  Widget _sw(String label, bool value, ValueChanged<bool> onChanged) {
+    return SwitchListTile(
+      dense: true,
+      contentPadding: EdgeInsets.zero,
+      title: Text(label),
+      value: value,
+      onChanged: onChanged,
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final bits = entropyBits(gen);
+    return ListView(padding: pagePad, children: [
+      const TabHeader(
+        icon: Icons.tune,
+        title: 'أدوات وإعدادات',
+        subtitle: 'قفل التطبيق، ومولّد كلمات سر، والتحكم في الحافظة',
+      ),
+      const SizedBox(height: 16),
+      _lockPanel(),
+      const SizedBox(height: 16),
+      Panel(
+        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          const SectionLabel('مولّد كلمات السر'),
+          Container(
+            width: double.infinity,
+            padding: const EdgeInsets.all(12),
+            decoration: BoxDecoration(
+              color: kCard2,
+              borderRadius: BorderRadius.circular(14),
+              border: Border.all(color: kLine),
+            ),
+            child: SelectableText(
+              gen.isEmpty ? '—' : gen,
+              contextMenuBuilder: noMenu,
+              textDirection: TextDirection.ltr,
+              style: const TextStyle(
+                  fontFamily: 'monospace', fontSize: 16, height: 1.4),
+            ),
+          ),
+          const SizedBox(height: 8),
+          StrengthMeter(bits),
+          const SizedBox(height: 8),
+          Text('الطول: $len'),
+          Slider(
+            value: len.toDouble(),
+            min: 8,
+            max: 64,
+            divisions: 56,
+            label: '$len',
+            onChanged: (v) => setState(() {
+              len = v.round();
+              _gen();
+            }),
+          ),
+          _sw('حروف صغيرة (a-z)', lower, (v) => setState(() {
+                lower = v;
+                _gen();
+              })),
+          _sw('حروف كبيرة (A-Z)', upper, (v) => setState(() {
+                upper = v;
+                _gen();
+              })),
+          _sw('أرقام (0-9)', digits, (v) => setState(() {
+                digits = v;
+                _gen();
+              })),
+          _sw('رموز (!@#...)', symbols, (v) => setState(() {
+                symbols = v;
+                _gen();
+              })),
+          _sw('تجنّب الحروف المتشابهة (l و I و O و 0 و 1)', noAmb,
+              (v) => setState(() {
+                    noAmb = v;
+                    _gen();
+                  })),
+          const SizedBox(height: 8),
+          Row(children: [
+            Expanded(
+              child: FilledButton.icon(
+                style: kBtn,
+                onPressed: () => setState(_gen),
+                icon: const Icon(Icons.casino),
+                label: const Text('توليد'),
+              ),
+            ),
+            const SizedBox(width: 10),
+            OutlinedButton.icon(
+              style: OutlinedButton.styleFrom(
+                minimumSize: const Size(52, 52),
+                shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(14)),
+              ),
+              onPressed: gen.isEmpty ? null : () => copySecure(context, gen),
+              icon: const Icon(Icons.copy),
+              label: const Text('نسخ'),
+            ),
+          ]),
+        ]),
+      ),
+      const SizedBox(height: 16),
+      Panel(
+        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          const SectionLabel('القفل التلقائي للخزنة بعد'),
+          ValueListenableBuilder<int>(
+            valueListenable: autoLockMin,
+            builder: (c, v, _) => SizedBox(
+              width: double.infinity,
+              child: SegmentedButton<int>(
+                showSelectedIcon: false,
+                segments: const [
+                  ButtonSegment(value: 1, label: Text('1 د')),
+                  ButtonSegment(value: 2, label: Text('2 د')),
+                  ButtonSegment(value: 5, label: Text('5 د')),
+                  ButtonSegment(value: 10, label: Text('10 د')),
+                ],
+                selected: {v},
+                onSelectionChanged: (s) {
+                  autoLockMin.value = s.first;
+                  _saveInt('autolock', s.first);
+                },
+              ),
+            ),
+          ),
+          const SizedBox(height: 16),
+          const SectionLabel('مسح الحافظة تلقائيًا بعد النسخ'),
+          ValueListenableBuilder<int>(
+            valueListenable: clipSecs,
+            builder: (c, v, _) => SizedBox(
+              width: double.infinity,
+              child: SegmentedButton<int>(
+                showSelectedIcon: false,
+                segments: const [
+                  ButtonSegment(value: 15, label: Text('15 ث')),
+                  ButtonSegment(value: 30, label: Text('30 ث')),
+                  ButtonSegment(value: 60, label: Text('60 ث')),
+                ],
+                selected: {v},
+                onSelectionChanged: (s) {
+                  clipSecs.value = s.first;
+                  _saveInt('clip', s.first);
+                },
+              ),
+            ),
+          ),
+          const SizedBox(height: 12),
+          OutlinedButton.icon(
+            onPressed: () async {
+              await Clipboard.setData(const ClipboardData(text: ''));
+              _snack('اتمسحت الحافظة');
+            },
+            icon: const Icon(Icons.content_paste_off),
+            label: const Text('امسح الحافظة دلوقتي'),
+          ),
+        ]),
+      ),
+      const SizedBox(height: 16),
+      Container(
+        width: double.infinity,
+        padding: const EdgeInsets.all(14),
+        decoration: BoxDecoration(
+          color: kBadSoft,
+          borderRadius: BorderRadius.circular(18),
+          border: Border.all(color: kBadLine),
+        ),
+        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          const Row(children: [
+            Icon(Icons.warning_amber, color: kBad),
+            SizedBox(width: 8),
+            Text('منطقة خطر',
+                style: TextStyle(color: kBad, fontWeight: FontWeight.w700)),
+          ]),
+          const SizedBox(height: 8),
+          const Text(
+            'مسح كل الخزن من الموبايل ده نهائيًا. اعمل نسخة احتياطية الأول من قايمة الخزنة (⋮ ← تصدير نسخة احتياطية).',
+            style: TextStyle(fontSize: 12.5, color: kMuted, height: 1.5),
+          ),
+          const SizedBox(height: 10),
+          OutlinedButton.icon(
+            style: OutlinedButton.styleFrom(
+              foregroundColor: kBad,
+              side: const BorderSide(color: kBadLine),
+            ),
+            onPressed: wiping ? null : _wipeAll,
+            icon: const Icon(Icons.delete_forever),
+            label: const Text('مسح كل الخزن من الموبايل'),
+          ),
+        ]),
+      ),
+    ]);
+  }
+}
+
+// ============================================================
+//  قفل التطبيق
+//  - كلمة القفل مش بتتخزّن: بنخزّن رسالة ثابتة مشفّرة بمفتاح مشتق منها (Argon2id)
+//    والتحقق = فك الرسالة بنجاح
+//  - تأخير متزايد بعد 3 محاولات غلط
+// ============================================================
+class AppLockStore {
+  static const String _k = 'applock.v1';
+  static const String _tag = 'KC-APPLOCK-OK';
+
+  static Future<bool> isSet() async {
+    final p = await SharedPreferences.getInstance();
+    return p.containsKey(_k);
+  }
+
+  static Future<void> setPassword(String pw) async {
+    final lvl = levels[0];
+    final salt = _rand(16);
+    final nonce = _rand(_nonceLen(3));
+    final header = (BytesBuilder()
+          ..add([0x4B, 0x4C, 1, 3])
+          ..add(_u32(lvl.mem))
+          ..addByte(lvl.iter)
+          ..addByte(1)
+          ..add(salt))
+        .toBytes();
+    final key = await compute(_derive, <String, Object>{
+      'pw': pw,
+      'salt': salt,
+      'mem': lvl.mem,
+      'iter': lvl.iter,
+      'len': _keyLen(3),
+    });
+    try {
+      final blob = await _seal(utf8.encode(_tag), key, 3, nonce, header);
+      final out = BytesBuilder()
+        ..add(header)
+        ..add(nonce)
+        ..add(blob);
+      final p = await SharedPreferences.getInstance();
+      await p.setString(_k, base64Url.encode(out.toBytes()));
+    } finally {
+      wipeBytes(key);
+    }
+  }
+
+  static Future<bool> verify(String pw) async {
+    List<int>? key;
+    try {
+      final p = await SharedPreferences.getInstance();
+      final raw = p.getString(_k);
+      if (raw == null) return false;
+      final b = base64Url.decode(base64Url.normalize(raw));
+      final nl = _nonceLen(3);
+      if (b.length < 26 + nl + 16 ||
+          b[0] != 0x4B ||
+          b[1] != 0x4C ||
+          b[2] != 1 ||
+          b[3] != 3) {
+        return false;
+      }
+      final mem = ByteData.sublistView(b, 4, 8).getUint32(0);
+      final iter = b[8];
+      if (mem < 8192 ||
+          mem > kMaxMem ||
+          iter < 1 ||
+          iter > kMaxIter ||
+          b[9] != 1) {
+        return false;
+      }
+      final header = b.sublist(0, 26);
+      final salt = b.sublist(10, 26);
+      final nonce = b.sublist(26, 26 + nl);
+      final blob = b.sublist(26 + nl);
+      key = await compute(_derive, <String, Object>{
+        'pw': pw,
+        'salt': salt,
+        'mem': mem,
+        'iter': iter,
+        'len': _keyLen(3),
+      });
+      final clear = await _open(blob, key, 3, nonce, header);
+      return utf8.decode(clear) == _tag;
+    } catch (_) {
+      return false;
+    } finally {
+      if (key != null) wipeBytes(key);
+    }
+  }
+
+  static Future<void> remove() async {
+    final p = await SharedPreferences.getInstance();
+    await p.remove(_k);
+    await p.remove('lock_fails');
+    await p.remove('lock_until');
+  }
+
+  static Future<int> lockedForMs() async {
+    final p = await SharedPreferences.getInstance();
+    final until = p.getInt('lock_until') ?? 0;
+    final left = until - DateTime.now().millisecondsSinceEpoch;
+    return left > 0 ? left : 0;
+  }
+
+  static Future<void> noteFail() async {
+    final p = await SharedPreferences.getInstance();
+    final fails = (p.getInt('lock_fails') ?? 0) + 1;
+    await p.setInt('lock_fails', fails);
+    if (fails >= 3) {
+      final secs = min(900, 5 * (1 << min(fails - 3, 8)));
+      await p.setInt(
+          'lock_until', DateTime.now().millisecondsSinceEpoch + secs * 1000);
+    }
+  }
+
+  static Future<void> noteOk() async {
+    final p = await SharedPreferences.getInstance();
+    await p.remove('lock_fails');
+    await p.remove('lock_until');
+  }
+}
+
+// نافذة بتطلب كلمة سر (أو كلمة جديدة مع تأكيد)
+class PwPromptDialog extends StatefulWidget {
+  const PwPromptDialog({super.key, required this.title, this.confirm = false});
+  final String title;
+  final bool confirm;
+  @override
+  State<PwPromptDialog> createState() => _PwPromptDialogState();
+}
+
+class _PwPromptDialogState extends State<PwPromptDialog> {
+  final a = TextEditingController();
+  final b = TextEditingController();
+  String? err;
+
+  @override
+  void dispose() {
+    a.dispose();
+    b.dispose();
+    super.dispose();
+  }
+
+  void _ok() {
+    if (a.text.isEmpty) {
+      setState(() => err = 'اكتب كلمة السر');
+      return;
+    }
+    if (widget.confirm) {
+      if (isWeakLock(a.text)) {
+        setState(() => err = lockWeakMsg);
+        return;
+      }
+      if (a.text != b.text) {
+        setState(() => err = 'كلمتين السر مش متطابقتين');
+        return;
+      }
+    }
+    Navigator.of(context).pop(a.text);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      backgroundColor: kCard,
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(22)),
+      title: Text(widget.title),
+      content: SingleChildScrollView(
+        child: Column(mainAxisSize: MainAxisSize.min, children: [
+          const SizedBox(height: 6),
+          PwField(a),
+          if (widget.confirm) ...[
+            const SizedBox(height: 10),
+            PwField(b, label: 'تأكيد كلمة السر'),
+          ],
+          if (err != null) Msg(err!),
+        ]),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(),
+          child: const Text('إلغاء'),
+        ),
+        FilledButton(onPressed: _ok, child: const Text('تأكيد')),
+      ],
+    );
+  }
+}
+
+// البوابة: بتعرض شاشة القفل (أو إعداد أول مرة) قبل ما تظهر الشاشة الرئيسية
+class AppLockGate extends StatefulWidget {
+  const AppLockGate({super.key, required this.child});
+  final Widget child;
+  @override
+  State<AppLockGate> createState() => _AppLockGateState();
+}
+
+class _AppLockGateState extends State<AppLockGate>
+    with WidgetsBindingObserver {
+  final pw = TextEditingController();
+  final pw2 = TextEditingController();
+  bool loaded = false;
+  bool needSetup = false;
+  bool busy = false;
+  String? err;
+  DateTime? _pausedAt;
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    appLockOn.addListener(_onChange);
+    appUnlocked.addListener(_onChange);
+    appIdle.addListener(_lockNow);
+    _init();
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    appLockOn.removeListener(_onChange);
+    appUnlocked.removeListener(_onChange);
+    appIdle.removeListener(_lockNow);
+    pw.dispose();
+    pw2.dispose();
+    super.dispose();
+  }
+
+  Future<void> _init() async {
+    try {
+      final p = await SharedPreferences.getInstance();
+      final isSet = p.containsKey('applock.v1');
+      final skipped = p.getBool('lock_skip') ?? false;
+      final g = p.getInt('lockgrace') ?? 0;
+      graceSecs.value = const [0, 30, 120].contains(g) ? g : 0;
+      appLockOn.value = isSet;
+      appUnlocked.value = !isSet;
+      needSetup = !isSet && !skipped;
+    } catch (_) {}
+    if (mounted) setState(() => loaded = true);
+  }
+
+  void _lockNow() {
+    if (appLockOn.value && appUnlocked.value) appUnlocked.value = false;
+  }
+
+  void _onChange() {
+    if (!mounted) return;
+    if (appLockOn.value && !appUnlocked.value) {
+      Navigator.of(context).popUntil((r) => r.isFirst);
+      pw.clear();
+      pw2.clear();
+      err = null;
+    }
+    setState(() {});
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.paused) {
+      _pausedAt = pickerOpen ? null : DateTime.now();
+      if (!pickerOpen && graceSecs.value == 0) _lockNow();
+    } else if (state == AppLifecycleState.resumed) {
+      final t = _pausedAt;
+      _pausedAt = null;
+      if (t != null &&
+          DateTime.now().difference(t).inSeconds >= graceSecs.value) {
+        _lockNow();
+      }
+    }
+  }
+
+  Future<void> _unlock() async {
+    if (busy) return;
+    if (pw.text.isEmpty) {
+      setState(() => err = 'اكتب كلمة السر');
+      return;
+    }
+    setState(() {
+      busy = true;
+      err = null;
+    });
+    try {
+      final wait = await AppLockStore.lockedForMs();
+      if (wait > 0) {
+        if (mounted) {
+          setState(() => err =
+              'محاولات غلط كتير. استنى ${(wait / 1000).ceil()} ثانية وجرّب تاني');
+        }
+        return;
+      }
+      final ok = await AppLockStore.verify(pw.text);
+      if (!mounted) return;
+      if (ok) {
+        await AppLockStore.noteOk();
+        pw.clear();
+        appUnlocked.value = true;
+      } else {
+        await AppLockStore.noteFail();
+        final w = await AppLockStore.lockedForMs();
+        if (mounted) {
+          setState(() => err = w > 0
+              ? 'كلمة السر غلط. استنى ${(w / 1000).ceil()} ثانية قبل المحاولة الجاية'
+              : 'كلمة السر غلط');
+        }
+      }
+    } catch (_) {
+      if (mounted) setState(() => err = 'حصل خطأ أثناء الفتح');
+    } finally {
+      if (mounted) setState(() => busy = false);
+    }
+  }
+
+  Future<void> _enable() async {
+    if (busy) return;
+    if (isWeakLock(pw.text)) {
+      setState(() => err = lockWeakMsg);
+      return;
+    }
+    if (pw.text != pw2.text) {
+      setState(() => err = 'كلمتين السر مش متطابقتين');
+      return;
+    }
+    setState(() {
+      busy = true;
+      err = null;
+    });
+    try {
+      await AppLockStore.setPassword(pw.text);
+      pw.clear();
+      pw2.clear();
+      needSetup = false;
+      appLockOn.value = true;
+      appUnlocked.value = true;
+    } catch (_) {
+      if (mounted) setState(() => err = 'حصل خطأ أثناء التفعيل');
+    } finally {
+      if (mounted) setState(() => busy = false);
+    }
+  }
+
+  Future<void> _skip() async {
+    try {
+      final p = await SharedPreferences.getInstance();
+      await p.setBool('lock_skip', true);
+    } catch (_) {}
+    pw.clear();
+    pw2.clear();
+    if (mounted) {
+      setState(() {
+        needSetup = false;
+        err = null;
+      });
+    }
+  }
+
+  Future<void> _forgot() async {
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: kCard,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(22)),
+        title: const Text('نسيت كلمة القفل؟'),
+        content: const Text(
+            'مفيش طريقة لاسترجاعها. الحل الوحيد إنك تمسح كل بيانات التطبيق: كل الخزن هتتمسح، وتقدر تستورد نسخة احتياطية بعد كده. تكمّل؟'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(false),
+            child: const Text('إلغاء'),
+          ),
+          FilledButton(
+            style: FilledButton.styleFrom(backgroundColor: kBad),
+            onPressed: () => Navigator.of(ctx).pop(true),
+            child: const Text('امسح كل حاجة'),
+          ),
+        ],
+      ),
+    );
+    if (ok != true || !mounted) return;
+    try {
+      await AppLockStore.remove();
+      await VaultStore.deleteAll();
+      final p = await SharedPreferences.getInstance();
+      await p.remove('lock_skip');
+      vaultsChanged.value++;
+      needSetup = true;
+      appLockOn.value = false;
+      appUnlocked.value = true;
+    } catch (_) {
+      if (mounted) setState(() => err = 'حصل خطأ أثناء المسح');
+    }
+    if (mounted) setState(() {});
+  }
+
+  Widget _setup() {
+    return Scaffold(
+      body: SafeArea(
+        child: ListView(padding: pagePad, children: [
+          const SizedBox(height: 32),
+          const Icon(Icons.shield, size: 64, color: kAccent),
+          const SizedBox(height: 12),
+          const Text('أمّن التطبيق',
+              textAlign: TextAlign.center,
+              style: TextStyle(fontSize: 22, fontWeight: FontWeight.w800)),
+          const SizedBox(height: 8),
+          const Text(
+            'اختار كلمة قفل عشان محدش غيرك يفتح التطبيق. مش هتتخزّن نفسها، وتقدر تغيّرها أو توقّفها بعدين من تاب «أدوات».',
+            textAlign: TextAlign.center,
+            style: TextStyle(color: kMuted, height: 1.5),
+          ),
+          const SizedBox(height: 24),
+          PwField(pw, label: 'كلمة قفل التطبيق', onChanged: () => setState(() {})),
+          const SizedBox(height: 12),
+          PwField(pw2, label: 'تأكيد كلمة القفل'),
+          const SizedBox(height: 16),
+          FilledButton.icon(
+            style: kBtn,
+            onPressed: busy ? null : _enable,
+            icon: busy
+                ? const SizedBox(
+                    width: 18,
+                    height: 18,
+                    child: CircularProgressIndicator(strokeWidth: 2))
+                : const Icon(Icons.lock),
+            label: Text(busy ? 'جارٍ التفعيل...' : 'تفعيل القفل'),
+          ),
+          if (err != null) Msg(err!),
+          const SizedBox(height: 8),
+          TextButton(
+            onPressed: busy ? null : _skip,
+            child: const Text('تخطي دلوقتي (مش مستحسن)'),
+          ),
+        ]),
+      ),
+    );
+  }
+
+  Widget _locked() {
+    return Scaffold(
+      body: SafeArea(
+        child: ListView(padding: pagePad, children: [
+          const SizedBox(height: 48),
+          const Icon(Icons.lock, size: 64, color: kAccent),
+          const SizedBox(height: 12),
+          const Text('THE CRYPT',
+              textAlign: TextAlign.center,
+              style: TextStyle(
+                  fontSize: 24, fontWeight: FontWeight.w800, letterSpacing: 4)),
+          const SizedBox(height: 6),
+          const Text('التطبيق مقفول',
+              textAlign: TextAlign.center, style: TextStyle(color: kMuted)),
+          const SizedBox(height: 28),
+          PwField(pw, label: 'كلمة قفل التطبيق'),
+          const SizedBox(height: 16),
+          FilledButton.icon(
+            style: kBtn,
+            onPressed: busy ? null : _unlock,
+            icon: busy
+                ? const SizedBox(
+                    width: 18,
+                    height: 18,
+                    child: CircularProgressIndicator(strokeWidth: 2))
+                : const Icon(Icons.lock_open),
+            label: Text(busy ? 'جارٍ التحقق...' : 'فتح'),
+          ),
+          if (err != null) Msg(err!),
+          const SizedBox(height: 8),
+          TextButton(
+            onPressed: busy ? null : _forgot,
+            child: const Text('نسيت كلمة السر؟'),
+          ),
+        ]),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (!loaded) {
+      return const Scaffold(body: Center(child: CircularProgressIndicator()));
+    }
+    if (needSetup) return _setup();
+    if (appLockOn.value && !appUnlocked.value) return _locked();
+    return widget.child;
   }
 }
