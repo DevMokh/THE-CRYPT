@@ -3075,14 +3075,15 @@ class AppLockStore {
       final salt = b.sublist(10, 26);
       final nonce = b.sublist(26, 26 + nl);
       final blob = b.sublist(26 + nl);
-      key = await compute(_derive, <String, Object>{
+      final k = await compute(_derive, <String, Object>{
         'pw': pw,
         'salt': salt,
         'mem': mem,
         'iter': iter,
         'len': _keyLen(3),
       });
-      final clear = await _open(blob, key, 3, nonce, header);
+      key = k;
+      final clear = await _open(blob, k, 3, nonce, header);
       return utf8.decode(clear) == _tag;
     } catch (_) {
       return false;
